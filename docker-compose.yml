@@ -1,0 +1,48 @@
+version: "3.8"
+
+services:
+  goproxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: goproxy
+    ports:
+      - "12345:12345"
+    volumes:
+      # Use a named volume for cache persistence
+      - goproxy-cache:/app/cache
+      # Or use a bind mount to persist on host:
+      # - ./cache:/app/cache
+    # Uncomment and modify to override defaults:
+    # environment:
+    #   PORT: 12345
+    #   CACHE_DIR: /app/cache
+    #   UPSTREAM_PROXY: https://proxy.golang.org
+    #   # Proxy configuration (for bypassing restrictions):
+    #   HTTP_PROXY: http://proxy-server:8080
+    #   HTTPS_PROXY: http://proxy-server:8080
+    #   SOCKS5_PROXY: socks5://socks5-server:1080
+    #   # DNS configuration (supports UDP, DoH, DoT, DoQ):
+    #   DNS_SERVER: 8.8.8.8:53
+    #   # DNS_SERVER: https://cloudflare-dns.com/dns-query
+    #   # DNS_SERVER: tls://1.1.1.1:853
+    #   # DNS_SERVER: quic://dns.adguard.com:853
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "--quiet",
+          "--tries=1",
+          "--spider",
+          "http://localhost:12345/health",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  goproxy-cache:
+    driver: local
