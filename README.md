@@ -615,5 +615,3 @@ The proxy will recreate it on startup.
 ## License
 
 MIT
-
-# go-proxy
