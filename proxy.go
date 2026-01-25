@@ -613,8 +613,32 @@ func (p *Proxy) handleZip(w http.ResponseWriter, r *http.Request, path string) {
 		return
 	}
 
+	// Check if cache file was created by another concurrent request (race condition check)
+	// Use write lock to ensure only one goroutine writes the cache
+	p.mu.Lock()
+	// Double-check: another goroutine might have cached it while we were fetching
+	if _, err := os.Stat(cachePath); err == nil {
+		// File exists now, another goroutine cached it
+		p.mu.Unlock()
+		file, err := os.Open(cachePath)
+		if err == nil {
+			defer file.Close()
+			stat, err := file.Stat()
+			if err == nil {
+				log.Printf("[CACHE HIT] %s (cached by concurrent request)", path)
+				w.Header().Set("Content-Type", "application/zip")
+				w.Header().Set("Content-Length", fmt.Sprintf("%d", stat.Size()))
+				io.Copy(w, file)
+				return
+			}
+		}
+		// If we can't read it, continue with fetch
+		p.mu.Lock()
+	}
+
 	// Create cache directory for this file
 	if err := os.MkdirAll(filepath.Dir(cachePath), 0755); err != nil {
+		p.mu.Unlock()
 		log.Printf("[ERROR] Failed to create cache dir for %s: %v", path, err)
 		http.Error(w, fmt.Sprintf("Failed to create cache dir: %v", err), http.StatusInternalServerError)
 		return
@@ -623,6 +647,7 @@ func (p *Proxy) handleZip(w http.ResponseWriter, r *http.Request, path string) {
 	// Write to cache and response simultaneously
 	cacheFile, err := os.Create(cachePath + ".tmp")
 	if err != nil {
+		p.mu.Unlock()
 		log.Printf("[ERROR] Failed to create cache file for %s: %v", path, err)
 		http.Error(w, fmt.Sprintf("Failed to create cache file: %v", err), http.StatusInternalServerError)
 		return
@@ -645,6 +670,7 @@ func (p *Proxy) handleZip(w http.ResponseWriter, r *http.Request, path string) {
 	cacheFile.Close()
 
 	if err != nil {
+		p.mu.Unlock()
 		log.Printf("[ERROR] Error copying zip for %s: %v (copied %d bytes in %v)", path, err, bytesCopied, time.Since(startTime))
 		// Remove partial cache file on error
 		os.Remove(cachePath + ".tmp")
@@ -655,8 +681,39 @@ func (p *Proxy) handleZip(w http.ResponseWriter, r *http.Request, path string) {
 	log.Printf("[SUCCESS] Cached zip %s (%d bytes in %v)", path, bytesCopied, time.Since(startTime))
 
 	// Atomically rename temp file to final cache file
-	if err := os.Rename(cachePath+".tmp", cachePath); err != nil {
-		log.Printf("[WARN] Failed to rename cache file for %s: %v", path, err)
-		os.Remove(cachePath + ".tmp")
+	tmpPath := cachePath + ".tmp"
+	
+	// Check if temp file exists before renaming
+	if _, err := os.Stat(tmpPath); os.IsNotExist(err) {
+		// Temp file doesn't exist - might have been renamed by another goroutine
+		// Check if final file exists (another goroutine might have already cached it)
+		if _, err := os.Stat(cachePath); err == nil {
+			log.Printf("[INFO] Cache file already exists for %s (likely cached by another request)", path)
+			return
+		}
+		log.Printf("[WARN] Temp cache file missing for %s but final file doesn't exist", path)
+		return
 	}
+	
+	// Check if final file already exists (race condition - another goroutine cached it first)
+	if _, err := os.Stat(cachePath); err == nil {
+		// Final file already exists, remove temp file
+		os.Remove(tmpPath)
+		log.Printf("[INFO] Cache file already exists for %s, removing duplicate temp file", path)
+		return
+	}
+	
+	// Perform atomic rename
+	if err := os.Rename(tmpPath, cachePath); err != nil {
+		// Check if it's because the file already exists (race condition)
+		if _, statErr := os.Stat(cachePath); statErr == nil {
+			// Final file exists now, just remove temp
+			os.Remove(tmpPath)
+			log.Printf("[INFO] Cache file was created by another request for %s", path)
+		} else {
+			log.Printf("[WARN] Failed to rename cache file for %s: %v", path, err)
+			os.Remove(tmpPath)
+		}
+	}
+	p.mu.Unlock() // Release lock after cache write is complete
 }
