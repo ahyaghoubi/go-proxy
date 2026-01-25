@@ -18,8 +18,7 @@ var (
 	upstream    = flag.String("upstream", "https://proxy.golang.org", "Upstream proxy URL")
 	httpProxy   = flag.String("proxy", "", "HTTP/HTTPS/SOCKS5 proxy URL (e.g., http://proxy:8080 or socks5://proxy:1080)")
 	dnsServer   = flag.String("dns", "", "DNS server URL (e.g., 8.8.8.8:53, https://cloudflare-dns.com/dns-query, tls://1.1.1.1:853)")
-	writeTimeout = flag.String("write-timeout", "20m", "HTTP write timeout (e.g., 20m, 10m, 5m)")
-	idleTimeout  = flag.String("idle-timeout", "60s", "HTTP idle timeout (e.g., 60s, 2m, 5m)")
+	writeTimeout = flag.String("write-timeout", "30m", "HTTP write timeout (e.g., 20m, 10m, 5m)")
 )
 
 func main() {
@@ -55,19 +54,11 @@ func main() {
 	if envWriteTimeout := os.Getenv("WRITE_TIMEOUT"); envWriteTimeout != "" {
 		*writeTimeout = envWriteTimeout
 	}
-	// Idle timeout from environment
-	if envIdleTimeout := os.Getenv("IDLE_TIMEOUT"); envIdleTimeout != "" {
-		*idleTimeout = envIdleTimeout
-	}
 
 	// Parse timeout durations
 	writeTimeoutDur, err := time.ParseDuration(*writeTimeout)
 	if err != nil {
 		log.Fatalf("Invalid write-timeout value '%s': %v (examples: 20m, 10m, 5m)", *writeTimeout, err)
-	}
-	idleTimeoutDur, err := time.ParseDuration(*idleTimeout)
-	if err != nil {
-		log.Fatalf("Invalid idle-timeout value '%s': %v (examples: 60s, 2m, 5m)", *idleTimeout, err)
 	}
 
 	// Ensure cache directory exists
@@ -88,7 +79,7 @@ func main() {
 		Handler:      mux,
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: writeTimeoutDur,
-		IdleTimeout:  idleTimeoutDur,
+		IdleTimeout:  15 * time.Second,
 	}
 
 	// Log startup configuration
@@ -103,7 +94,6 @@ func main() {
 		log.Printf("  DNS server: %s", *dnsServer)
 	}
 	log.Printf("  Write timeout: %v", writeTimeoutDur)
-	log.Printf("  Idle timeout: %v", idleTimeoutDur)
 	log.Printf("  Set GOPROXY=http://localhost%s,direct", addr)
 
 	// Start server in a goroutine
