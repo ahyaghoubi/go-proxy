@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -11,14 +13,149 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/miekg/dns"
 	"golang.org/x/net/proxy"
 )
+
+// upstreamStatusError carries the HTTP status from upstream for propagation to the client
+type upstreamStatusError struct {
+	status int
+}
+
+func (e *upstreamStatusError) Error() string {
+	return fmt.Sprintf("upstream returned %d", e.status)
+}
+
+var progressOutputMu sync.Mutex
+
+// isStderrTTY returns true if stderr is a terminal (supports \r for in-place updates)
+func isStderrTTY() bool {
+	fi, err := os.Stderr.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}
+
+// progressReader wraps an io.Reader and reports download progress
+type progressReader struct {
+	reader         io.Reader
+	total          int64
+	downloaded     atomic.Int64
+	path           string
+	startTime      time.Time
+	progressTicker *time.Ticker
+	done           chan struct{}
+}
+
+// newProgressReader creates a reader that logs progress at regular intervals
+func newProgressReader(r io.Reader, total int64, path string) *progressReader {
+	pr := &progressReader{
+		reader:    r,
+		total:     total,
+		path:      path,
+		startTime: time.Now(),
+		done:      make(chan struct{}),
+	}
+	pr.downloaded.Store(0)
+
+	// Log progress every 500ms
+	pr.progressTicker = time.NewTicker(500 * time.Millisecond)
+	go pr.logProgress()
+	return pr
+}
+
+func (pr *progressReader) Read(p []byte) (n int, err error) {
+	n, err = pr.reader.Read(p)
+	pr.downloaded.Add(int64(n))
+	return n, err
+}
+
+func (pr *progressReader) Close() {
+	pr.progressTicker.Stop()
+	close(pr.done)
+	// Finalize the progress line with newline so next log appears below (TTY: \r line has no \n yet)
+	progressOutputMu.Lock()
+	if isStderrTTY() {
+		fmt.Fprint(os.Stderr, "\n")
+	}
+	os.Stderr.Sync()
+	progressOutputMu.Unlock()
+}
+
+func formatBytes(b int64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
+func (pr *progressReader) logProgress() {
+	for {
+		select {
+		case <-pr.done:
+			return
+		case <-pr.progressTicker.C:
+			downloaded := pr.downloaded.Load()
+			elapsed := time.Since(pr.startTime).Seconds()
+			speed := float64(0)
+			if elapsed > 0 {
+				speed = float64(downloaded) / elapsed
+			}
+
+			var progressLine string
+			if pr.total > 0 {
+				percent := float64(downloaded) / float64(pr.total) * 100
+				remaining := pr.total - downloaded
+				eta := time.Duration(0)
+				if speed > 0 && remaining > 0 {
+					eta = time.Duration(float64(remaining)/speed) * time.Second
+				}
+
+				// Progress bar: 20 chars
+				barWidth := 20
+				filled := int(percent / 100 * float64(barWidth))
+				if filled > barWidth {
+					filled = barWidth
+				}
+				bar := strings.Repeat("=", filled) + ">" + strings.Repeat(" ", barWidth-filled)
+				if filled == barWidth {
+					bar = strings.Repeat("=", barWidth)
+				}
+
+				progressLine = fmt.Sprintf("[%s] %5.1f%% | %s/s | %s left | ETA %v",
+					bar, percent, formatBytes(int64(speed)), formatBytes(remaining), eta.Round(time.Second))
+			} else {
+				progressLine = fmt.Sprintf("downloaded %s | %s/s",
+					formatBytes(downloaded), formatBytes(int64(speed)))
+			}
+
+			// In-place update: overwrite same line until download finishes (\r = carriage return)
+			// Use \r for TTY (stays at bottom), \n for non-TTY (e.g. Docker logs) so updates appear live
+			progressOutputMu.Lock()
+			if isStderrTTY() {
+				fmt.Fprintf(os.Stderr, "\r[DOWNLOAD] %s | %s    ", pr.path, progressLine)
+			} else {
+				fmt.Fprintf(os.Stderr, "[DOWNLOAD] %s | %s\n", pr.path, progressLine)
+			}
+			os.Stderr.Sync() // Flush so output appears live
+			progressOutputMu.Unlock()
+		}
+	}
+}
 
 // DNSResolver handles different DNS protocol types
 type DNSResolver interface {
@@ -243,17 +380,122 @@ func createDialer(dnsResolver DNSResolver) func(ctx context.Context, network, ad
 	return dialer.DialContext
 }
 
-// Proxy handles Go module proxy requests with disk caching
-type Proxy struct {
-	cacheDir string
-	upstream string
-	client   *http.Client
-	mu       sync.RWMutex
+// inFlightFetch holds state for in-flight request deduplication
+type inFlightFetch struct {
+	cond     *sync.Cond
+	done     bool
+	byteData []byte
+	filePath string
+	err      error
 }
 
-// NewProxy creates a new proxy instance with configured HTTP client
-func NewProxy(cacheDir, upstream, httpProxy, dnsServer string) *Proxy {
-	// Create DNS resolver
+// Proxy handles Go module proxy requests with disk caching
+type Proxy struct {
+	cacheDir        string
+	upstreams       []string
+	privateUpstreams []PrivateUpstream
+	gosumdb         string
+	gonosumdb       []string
+	retryAttempts   int
+	retryBackoff    time.Duration
+	client          *http.Client
+	usageStore      *UsageStore
+	mu              sync.RWMutex
+	inFlightMu      sync.Mutex
+	inFlight        map[string]*inFlightFetch
+}
+
+// NewProxyFromConfig creates a proxy from Config with all features (upstreams, retry, dedup, etc.)
+func NewProxyFromConfig(cfg *Config, maxCacheAge, cleanupInterval, retryBackoff time.Duration) *Proxy {
+	upstreams := cfg.Upstreams
+	if len(upstreams) == 0 {
+		upstreams = []string{"https://proxy.golang.org"}
+	}
+	for i, u := range upstreams {
+		upstreams[i] = strings.TrimSuffix(u, "/")
+	}
+
+	gonosumdb := parseGONOSUMDB(cfg.GONOSUMDB)
+
+	p := newProxyWithClient(
+		cfg.CacheDir,
+		upstreams,
+		cfg.PrivateUpstreams,
+		cfg.GOSUMDB,
+		gonosumdb,
+		cfg.RetryAttempts,
+		retryBackoff,
+		cfg.Proxy,
+		cfg.DNSServer,
+		maxCacheAge,
+		cleanupInterval,
+	)
+	return p
+}
+
+func parseGONOSUMDB(s string) []string {
+	if s == "" {
+		return nil
+	}
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// newProxyWithClient creates a Proxy with the given parameters and HTTP client (shared by NewProxy/NewProxyFromConfig)
+func newProxyWithClient(
+	cacheDir string,
+	upstreams []string,
+	privateUpstreams []PrivateUpstream,
+	gosumdb string,
+	gonosumdb []string,
+	retryAttempts int,
+	retryBackoff time.Duration,
+	httpProxy, dnsServer string,
+	maxCacheAge, cleanupInterval time.Duration,
+) *Proxy {
+	transport := createTransport(httpProxy, dnsServer)
+
+	p := &Proxy{
+		cacheDir:        cacheDir,
+		upstreams:       upstreams,
+		privateUpstreams: privateUpstreams,
+		gosumdb:         gosumdb,
+		gonosumdb:       gonosumdb,
+		retryAttempts:   retryAttempts,
+		retryBackoff:    retryBackoff,
+		client: &http.Client{
+			Timeout:   5 * time.Minute,
+			Transport: transport,
+		},
+		inFlight: make(map[string]*inFlightFetch),
+	}
+
+	if retryAttempts <= 0 {
+		p.retryAttempts = 3
+	}
+	if retryBackoff <= 0 {
+		p.retryBackoff = 100 * time.Millisecond
+	}
+
+	usageStore, err := NewUsageStore(cacheDir)
+	if err != nil {
+		log.Printf("[WARN] Failed to initialize usage store: %v (cache TTL cleanup disabled)", err)
+	} else {
+		p.usageStore = usageStore
+		go usageStore.RunCleanup(maxCacheAge, cleanupInterval)
+	}
+
+	return p
+}
+
+// createTransport builds an http.Transport from proxy and DNS config
+func createTransport(httpProxy, dnsServer string) *http.Transport {
 	dnsResolver, err := createDNSResolver(dnsServer)
 	if err != nil {
 		log.Printf("[WARN] Failed to create DNS resolver: %v", err)
@@ -262,20 +504,17 @@ func NewProxy(cacheDir, upstream, httpProxy, dnsServer string) *Proxy {
 		log.Printf("Using DNS resolver: %s", dnsServer)
 	}
 
-	// Create dialer with DNS support
 	dialer := createDialer(dnsResolver)
 
-	// Configure HTTP client with proper timeouts and connection pooling
 	transport := &http.Transport{
 		DialContext:           dialer,
-		TLSHandshakeTimeout:   5 * time.Second,  // TLS handshake timeout
-		ResponseHeaderTimeout: 10 * time.Second, // Response header timeout
-		IdleConnTimeout:       90 * time.Second, // Idle connection timeout
-		MaxIdleConns:          100,              // Maximum idle connections
-		MaxIdleConnsPerHost:   10,               // Maximum idle connections per host
+		TLSHandshakeTimeout:   5 * time.Second,
+		ResponseHeaderTimeout: 10 * time.Second,
+		IdleConnTimeout:       90 * time.Second,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   10,
 	}
 
-	// Determine proxy URL: flag > HTTP_PROXY > HTTPS_PROXY > SOCKS5_PROXY
 	proxyURL := httpProxy
 	if proxyURL == "" {
 		proxyURL = os.Getenv("HTTP_PROXY")
@@ -287,7 +526,6 @@ func NewProxy(cacheDir, upstream, httpProxy, dnsServer string) *Proxy {
 		proxyURL = os.Getenv("SOCKS5_PROXY")
 	}
 
-	// Configure proxy if provided
 	if proxyURL != "" {
 		parsedURL, err := url.Parse(proxyURL)
 		if err != nil {
@@ -295,20 +533,15 @@ func NewProxy(cacheDir, upstream, httpProxy, dnsServer string) *Proxy {
 		} else {
 			switch parsedURL.Scheme {
 			case "http", "https":
-				// HTTP/HTTPS proxy
 				transport.Proxy = http.ProxyURL(parsedURL)
 				log.Printf("Using HTTP proxy: %s", proxyURL)
 			case "socks5", "socks5h":
-				// SOCKS5 proxy
 				socksDialer, err := proxy.SOCKS5("tcp", parsedURL.Host, nil, proxy.Direct)
 				if err != nil {
 					log.Printf("[WARN] Failed to create SOCKS5 dialer: %v", err)
 				} else {
-					// For SOCKS5, we still want DNS resolution to use custom DNS if specified
 					if dnsResolver != nil {
-						// Create a wrapper that uses custom DNS before SOCKS5
 						transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
-							// Resolve address using custom DNS
 							host, port, err := net.SplitHostPort(address)
 							if err != nil {
 								return nil, err
@@ -317,7 +550,6 @@ func NewProxy(cacheDir, upstream, httpProxy, dnsServer string) *Proxy {
 							if err != nil || len(ips) == 0 {
 								return nil, fmt.Errorf("failed to resolve %s: %v", host, err)
 							}
-							// Use first IP
 							resolvedAddr := net.JoinHostPort(ips[0].String(), port)
 							return socksDialer.(proxy.ContextDialer).DialContext(ctx, network, resolvedAddr)
 						}
@@ -327,20 +559,201 @@ func NewProxy(cacheDir, upstream, httpProxy, dnsServer string) *Proxy {
 					log.Printf("Using SOCKS5 proxy: %s", proxyURL)
 				}
 			default:
-				log.Printf("[WARN] Unsupported proxy scheme: %s (supported: http, https, socks5, socks5h)", parsedURL.Scheme)
+				log.Printf("[WARN] Unsupported proxy scheme: %s", parsedURL.Scheme)
 			}
 		}
 	}
 
-	return &Proxy{
-		cacheDir: cacheDir,
-		upstream: strings.TrimSuffix(upstream, "/"),
-		client: &http.Client{
-			Timeout:   5 * time.Minute, // Increased timeout for large files (zip downloads)
-			Transport: transport,
-		},
-		mu: sync.RWMutex{},
+	return transport
+}
+
+// NewProxy creates a new proxy instance (backward compatible; uses single upstream)
+func NewProxy(cacheDir, upstream, httpProxy, dnsServer string, maxCacheAge, cleanupInterval time.Duration) *Proxy {
+	upstreams := []string{strings.TrimSuffix(upstream, "/")}
+	return newProxyWithClient(
+		cacheDir, upstreams, nil, "sum.golang.org", nil,
+		3, 100*time.Millisecond,
+		httpProxy, dnsServer, maxCacheAge, cleanupInterval,
+	)
+}
+
+// Shutdown stops background cleanup and closes the usage store.
+func (p *Proxy) Shutdown() {
+	if p.usageStore != nil {
+		p.usageStore.Stop()
+		_ = p.usageStore.Close()
 	}
+}
+
+// selectUpstream returns the base URL and optional auth for the given path
+func (p *Proxy) selectUpstream(requestPath string) (baseURL string, auth *AuthConfig) {
+	module := pathToModule(requestPath)
+	for _, pu := range p.privateUpstreams {
+		pattern := strings.TrimSpace(pu.Pattern)
+		if pattern == "" {
+			continue
+		}
+		matched, err := path.Match(pattern, module)
+		if err != nil {
+			continue
+		}
+		if matched {
+			u := strings.TrimSuffix(pu.URL, "/")
+			return u, &pu.Auth
+		}
+	}
+	if len(p.upstreams) > 0 {
+		return p.upstreams[0], nil
+	}
+	return "https://proxy.golang.org", nil
+}
+
+// addAuthHeaders adds auth headers to the request
+func addAuthHeaders(req *http.Request, auth *AuthConfig) {
+	if auth == nil {
+		return
+	}
+	switch strings.ToLower(auth.Type) {
+	case "basic":
+		if auth.Value != "" {
+			encoded := base64.StdEncoding.EncodeToString([]byte(auth.Value))
+			req.Header.Set("Authorization", "Basic "+encoded)
+		}
+	case "bearer":
+		if auth.Value != "" {
+			req.Header.Set("Authorization", "Bearer "+auth.Value)
+		}
+	case "header":
+		if auth.Name != "" && auth.Value != "" {
+			req.Header.Set(auth.Name, auth.Value)
+		}
+	}
+}
+
+// doWithRetry executes the request with retries on transient failures
+func (p *Proxy) doWithRetry(req *http.Request) (*http.Response, error) {
+	var lastErr error
+	backoff := p.retryBackoff
+	for attempt := 0; attempt < p.retryAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(backoff)
+			backoff *= 2
+		}
+		resp, err := p.client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		// Retry on 5xx and 429
+		if resp.StatusCode >= 500 || resp.StatusCode == 429 {
+			status := resp.StatusCode
+			resp.Body.Close()
+			lastErr = &upstreamStatusError{status: status}
+			continue
+		}
+		return resp, nil
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, fmt.Errorf("max retries exceeded")
+}
+
+// fetchFromUpstreams tries each upstream until success; 404/410 try next upstream
+func (p *Proxy) fetchFromUpstreams(requestPath string, req *http.Request) (*http.Response, error) {
+	baseURL, auth := p.selectUpstream(requestPath)
+	var upstreams []string
+	if auth != nil {
+		upstreams = []string{baseURL}
+	} else {
+		upstreams = p.upstreams
+		if len(upstreams) == 0 {
+			upstreams = []string{"https://proxy.golang.org"}
+		}
+	}
+
+	var lastErr error
+	for _, u := range upstreams {
+		u = strings.TrimSuffix(u, "/")
+		fetchURL := u + "/" + requestPath
+		fetchReq, err := http.NewRequestWithContext(req.Context(), http.MethodGet, fetchURL, nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		addAuthHeaders(fetchReq, auth)
+		resp, err := p.doWithRetry(fetchReq)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if resp.StatusCode == 404 || resp.StatusCode == 410 {
+			status := resp.StatusCode
+			resp.Body.Close()
+			lastErr = &upstreamStatusError{status: status}
+			continue
+		}
+		return resp, nil
+	}
+	return nil, lastErr
+}
+
+// fetchWithDedup fetches bytes with in-flight deduplication
+func (p *Proxy) fetchWithDedup(requestPath string, fetchFn func() ([]byte, error)) ([]byte, error) {
+	p.inFlightMu.Lock()
+	if f, ok := p.inFlight[requestPath]; ok {
+		for !f.done {
+			f.cond.Wait()
+		}
+		p.inFlightMu.Unlock()
+		if f.err != nil {
+			return nil, f.err
+		}
+		return f.byteData, nil
+	}
+	f := &inFlightFetch{cond: sync.NewCond(&p.inFlightMu)}
+	p.inFlight[requestPath] = f
+	p.inFlightMu.Unlock()
+
+	f.byteData, f.err = fetchFn()
+
+	p.inFlightMu.Lock()
+	f.done = true
+	f.cond.Broadcast()
+	delete(p.inFlight, requestPath)
+	p.inFlightMu.Unlock()
+
+	return f.byteData, f.err
+}
+
+// fetchZipWithDedup fetches zip with in-flight deduplication; waiters read from cache when done
+func (p *Proxy) fetchZipWithDedup(requestPath, cachePath string, fetchFn func() (string, error)) (string, error) {
+	p.inFlightMu.Lock()
+	if f, ok := p.inFlight[requestPath]; ok {
+		for !f.done {
+			f.cond.Wait()
+		}
+		p.inFlightMu.Unlock()
+		if f.err != nil {
+			return "", f.err
+		}
+		return f.filePath, nil
+	}
+	f := &inFlightFetch{cond: sync.NewCond(&p.inFlightMu)}
+	p.inFlight[requestPath] = f
+	p.inFlightMu.Unlock()
+
+	filePath, fetchErr := fetchFn()
+
+	p.inFlightMu.Lock()
+	f.done = true
+	f.filePath = filePath
+	f.err = fetchErr
+	f.cond.Broadcast()
+	delete(p.inFlight, requestPath)
+	p.inFlightMu.Unlock()
+
+	return filePath, fetchErr
 }
 
 // HandleRequest routes requests to appropriate handlers
@@ -382,8 +795,8 @@ func (p *Proxy) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleList handles GET /<module>/@v/list requests
-func (p *Proxy) handleList(w http.ResponseWriter, r *http.Request, path string) {
-	cachePath := cachePath(p.cacheDir, path)
+func (p *Proxy) handleList(w http.ResponseWriter, r *http.Request, requestPath string) {
+	cachePath := cachePath(p.cacheDir, requestPath)
 
 	// Try cache first (read lock)
 	p.mu.RLock()
@@ -391,57 +804,62 @@ func (p *Proxy) handleList(w http.ResponseWriter, r *http.Request, path string) 
 	p.mu.RUnlock()
 
 	if err == nil {
-		log.Printf("[CACHE HIT] %s", path)
+		log.Printf("[CACHE HIT] %s", requestPath)
+		if p.usageStore != nil {
+			p.usageStore.RecordUsage(requestPath)
+		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Write(cached)
 		return
 	}
 
-	log.Printf("[CACHE MISS] %s", path)
+	log.Printf("[CACHE MISS] %s", requestPath)
 
-	// Fetch from upstream
-	url := fmt.Sprintf("%s/%s", p.upstream, path)
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, url, nil)
+	data, err := p.fetchWithDedup(requestPath, func() ([]byte, error) {
+		resp, err := p.fetchFromUpstreams(requestPath, r)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("upstream returned %d", resp.StatusCode)
+		}
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, err
+		}
+		p.mu.Lock()
+		_ = writeCache(cachePath, data)
+		p.mu.Unlock()
+		return data, nil
+	})
+
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to create request: %v", err), http.StatusInternalServerError)
+		writeFetchError(w, requestPath, err)
 		return
 	}
 
-	resp, err := p.client.Do(req)
-	if err != nil {
-		log.Printf("[ERROR] Failed to fetch %s: %v", url, err)
-		http.Error(w, fmt.Sprintf("Failed to fetch: %v", err), http.StatusBadGateway)
-		return
+	if p.usageStore != nil {
+		p.usageStore.RecordUsage(requestPath)
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("[ERROR] Upstream returned %d for %s", resp.StatusCode, url)
-		http.Error(w, fmt.Sprintf("Upstream error: %d", resp.StatusCode), resp.StatusCode)
-		return
-	}
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		log.Printf("[ERROR] Failed to read response for %s: %v", url, err)
-		http.Error(w, fmt.Sprintf("Failed to read response: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	// Cache the response (write lock)
-	p.mu.Lock()
-	if err := writeCache(cachePath, data); err != nil {
-		log.Printf("[WARN] Failed to cache %s: %v", path, err)
-	}
-	p.mu.Unlock()
-
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Write(data)
 }
 
+func writeFetchError(w http.ResponseWriter, path string, err error) {
+	var ue *upstreamStatusError
+	if errors.As(err, &ue) {
+		log.Printf("[ERROR] Upstream returned %d for %s", ue.status, path)
+		http.Error(w, err.Error(), ue.status)
+	} else {
+		log.Printf("[ERROR] Failed to fetch %s: %v", path, err)
+		http.Error(w, fmt.Sprintf("Failed to fetch: %v", err), http.StatusBadGateway)
+	}
+}
+
 // handleInfo handles GET /<module>/@v/<version>.info requests
-func (p *Proxy) handleInfo(w http.ResponseWriter, r *http.Request, path string) {
-	cachePath := cachePath(p.cacheDir, path)
+func (p *Proxy) handleInfo(w http.ResponseWriter, r *http.Request, requestPath string) {
+	cachePath := cachePath(p.cacheDir, requestPath)
 
 	// Try cache first (read lock)
 	p.mu.RLock()
@@ -449,65 +867,55 @@ func (p *Proxy) handleInfo(w http.ResponseWriter, r *http.Request, path string) 
 	p.mu.RUnlock()
 
 	if err == nil {
-		log.Printf("[CACHE HIT] %s", path)
+		log.Printf("[CACHE HIT] %s", requestPath)
+		if p.usageStore != nil {
+			p.usageStore.RecordUsage(requestPath)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(cached)
 		return
 	}
 
-	log.Printf("[CACHE MISS] %s", path)
+	log.Printf("[CACHE MISS] %s", requestPath)
 
-	// Fetch from upstream
-	url := fmt.Sprintf("%s/%s", p.upstream, path)
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, url, nil)
+	data, err := p.fetchWithDedup(requestPath, func() ([]byte, error) {
+		resp, err := p.fetchFromUpstreams(requestPath, r)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("upstream returned %d", resp.StatusCode)
+		}
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, err
+		}
+		var info map[string]interface{}
+		if err := json.Unmarshal(data, &info); err != nil {
+			return nil, fmt.Errorf("invalid JSON: %w", err)
+		}
+		p.mu.Lock()
+		_ = writeCache(cachePath, data)
+		p.mu.Unlock()
+		return data, nil
+	})
+
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to create request: %v", err), http.StatusInternalServerError)
+		writeFetchError(w, requestPath, err)
 		return
 	}
 
-	resp, err := p.client.Do(req)
-	if err != nil {
-		log.Printf("[ERROR] Failed to fetch %s: %v", url, err)
-		http.Error(w, fmt.Sprintf("Failed to fetch: %v", err), http.StatusBadGateway)
-		return
+	if p.usageStore != nil {
+		p.usageStore.RecordUsage(requestPath)
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("[ERROR] Upstream returned %d for %s", resp.StatusCode, url)
-		http.Error(w, fmt.Sprintf("Upstream error: %d", resp.StatusCode), resp.StatusCode)
-		return
-	}
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		log.Printf("[ERROR] Failed to read response for %s: %v", url, err)
-		http.Error(w, fmt.Sprintf("Failed to read response: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	// Validate JSON
-	var info map[string]interface{}
-	if err := json.Unmarshal(data, &info); err != nil {
-		log.Printf("[ERROR] Invalid JSON from upstream for %s: %v", url, err)
-		http.Error(w, fmt.Sprintf("Invalid JSON: %v", err), http.StatusBadGateway)
-		return
-	}
-
-	// Cache the response (write lock)
-	p.mu.Lock()
-	if err := writeCache(cachePath, data); err != nil {
-		log.Printf("[WARN] Failed to cache %s: %v", path, err)
-	}
-	p.mu.Unlock()
-
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(data)
 }
 
 // handleMod handles GET /<module>/@v/<version>.mod requests
-func (p *Proxy) handleMod(w http.ResponseWriter, r *http.Request, path string) {
-	cachePath := cachePath(p.cacheDir, path)
+func (p *Proxy) handleMod(w http.ResponseWriter, r *http.Request, requestPath string) {
+	cachePath := cachePath(p.cacheDir, requestPath)
 
 	// Try cache first (read lock)
 	p.mu.RLock()
@@ -515,57 +923,51 @@ func (p *Proxy) handleMod(w http.ResponseWriter, r *http.Request, path string) {
 	p.mu.RUnlock()
 
 	if err == nil {
-		log.Printf("[CACHE HIT] %s", path)
+		log.Printf("[CACHE HIT] %s", requestPath)
+		if p.usageStore != nil {
+			p.usageStore.RecordUsage(requestPath)
+		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Write(cached)
 		return
 	}
 
-	log.Printf("[CACHE MISS] %s", path)
+	log.Printf("[CACHE MISS] %s", requestPath)
 
-	// Fetch from upstream
-	url := fmt.Sprintf("%s/%s", p.upstream, path)
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, url, nil)
+	data, err := p.fetchWithDedup(requestPath, func() ([]byte, error) {
+		resp, err := p.fetchFromUpstreams(requestPath, r)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("upstream returned %d", resp.StatusCode)
+		}
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, err
+		}
+		p.mu.Lock()
+		_ = writeCache(cachePath, data)
+		p.mu.Unlock()
+		return data, nil
+	})
+
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to create request: %v", err), http.StatusInternalServerError)
+		writeFetchError(w, requestPath, err)
 		return
 	}
 
-	resp, err := p.client.Do(req)
-	if err != nil {
-		log.Printf("[ERROR] Failed to fetch %s: %v", url, err)
-		http.Error(w, fmt.Sprintf("Failed to fetch: %v", err), http.StatusBadGateway)
-		return
+	if p.usageStore != nil {
+		p.usageStore.RecordUsage(requestPath)
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("[ERROR] Upstream returned %d for %s", resp.StatusCode, url)
-		http.Error(w, fmt.Sprintf("Upstream error: %d", resp.StatusCode), resp.StatusCode)
-		return
-	}
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		log.Printf("[ERROR] Failed to read response for %s: %v", url, err)
-		http.Error(w, fmt.Sprintf("Failed to read response: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	// Cache the response (write lock)
-	p.mu.Lock()
-	if err := writeCache(cachePath, data); err != nil {
-		log.Printf("[WARN] Failed to cache %s: %v", path, err)
-	}
-	p.mu.Unlock()
-
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Write(data)
 }
 
 // handleZip handles GET /<module>/@v/<version>.zip requests
-func (p *Proxy) handleZip(w http.ResponseWriter, r *http.Request, path string) {
-	cachePath := cachePath(p.cacheDir, path)
+func (p *Proxy) handleZip(w http.ResponseWriter, r *http.Request, requestPath string) {
+	cachePath := cachePath(p.cacheDir, requestPath)
 
 	// Try cache first (read lock)
 	p.mu.RLock()
@@ -576,7 +978,10 @@ func (p *Proxy) handleZip(w http.ResponseWriter, r *http.Request, path string) {
 		defer file.Close()
 		stat, err := file.Stat()
 		if err == nil {
-			log.Printf("[CACHE HIT] %s", path)
+			log.Printf("[CACHE HIT] %s", requestPath)
+			if p.usageStore != nil {
+				p.usageStore.RecordUsage(requestPath)
+			}
 			w.Header().Set("Content-Type", "application/zip")
 			w.Header().Set("Content-Length", fmt.Sprintf("%d", stat.Size()))
 			io.Copy(w, file)
@@ -585,135 +990,84 @@ func (p *Proxy) handleZip(w http.ResponseWriter, r *http.Request, path string) {
 		file.Close()
 	}
 
-	log.Printf("[CACHE MISS] %s", path)
+	log.Printf("[CACHE MISS] %s", requestPath)
 
-	// Fetch from upstream
-	// Use extended context timeout for zip files (up to 10 minutes)
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
-	defer cancel()
-
-	url := fmt.Sprintf("%s/%s", p.upstream, path)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to create request: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	resp, err := p.client.Do(req)
-	if err != nil {
-		log.Printf("[ERROR] Failed to fetch %s: %v", url, err)
-		http.Error(w, fmt.Sprintf("Failed to fetch: %v", err), http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("[ERROR] Upstream returned %d for %s", resp.StatusCode, url)
-		http.Error(w, fmt.Sprintf("Upstream error: %d", resp.StatusCode), resp.StatusCode)
-		return
-	}
-
-	// Check if cache file was created by another concurrent request (race condition check)
-	// Use write lock to ensure only one goroutine writes the cache
-	p.mu.Lock()
-	// Double-check: another goroutine might have cached it while we were fetching
-	if _, err := os.Stat(cachePath); err == nil {
-		// File exists now, another goroutine cached it
-		p.mu.Unlock()
-		file, err := os.Open(cachePath)
-		if err == nil {
-			defer file.Close()
-			stat, err := file.Stat()
-			if err == nil {
-				log.Printf("[CACHE HIT] %s (cached by concurrent request)", path)
-				w.Header().Set("Content-Type", "application/zip")
-				w.Header().Set("Content-Length", fmt.Sprintf("%d", stat.Size()))
-				io.Copy(w, file)
-				return
-			}
+	finalPath, err := p.fetchZipWithDedup(requestPath, cachePath, func() (string, error) {
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
+		defer cancel()
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "", nil)
+		resp, err := p.fetchFromUpstreams(requestPath, req)
+		if err != nil {
+			return "", err
 		}
-		// If we can't read it, continue with fetch
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return "", fmt.Errorf("upstream returned %d", resp.StatusCode)
+		}
+
+		if err := os.MkdirAll(filepath.Dir(cachePath), 0755); err != nil {
+			return "", err
+		}
+		tmpPath := cachePath + ".tmp"
+		tmpFile, err := os.Create(tmpPath)
+		if err != nil {
+			return "", err
+		}
+		totalSize := resp.ContentLength
+		progressBody := newProgressReader(resp.Body, totalSize, requestPath)
+		buf := make([]byte, 64*1024)
+		_, err = io.CopyBuffer(tmpFile, progressBody, buf)
+		progressBody.Close()
+		tmpFile.Close()
+		if err != nil {
+			os.Remove(tmpPath)
+			return "", err
+		}
+
+		data, err := os.ReadFile(tmpPath)
+		if err != nil {
+			os.Remove(tmpPath)
+			return "", err
+		}
+
+		module, version := pathToModuleAndVersion(requestPath)
+		if err := VerifyZip(p.gosumdb, module, version, data, p.gonosumdb); err != nil {
+			os.Remove(tmpPath)
+			return "", fmt.Errorf("checksum verification failed: %w", err)
+		}
+
 		p.mu.Lock()
-	}
-
-	// Create cache directory for this file
-	if err := os.MkdirAll(filepath.Dir(cachePath), 0755); err != nil {
-		p.mu.Unlock()
-		log.Printf("[ERROR] Failed to create cache dir for %s: %v", path, err)
-		http.Error(w, fmt.Sprintf("Failed to create cache dir: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	// Write to cache and response simultaneously
-	cacheFile, err := os.Create(cachePath + ".tmp")
-	if err != nil {
-		p.mu.Unlock()
-		log.Printf("[ERROR] Failed to create cache file for %s: %v", path, err)
-		http.Error(w, fmt.Sprintf("Failed to create cache file: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	// Set headers before writing
-	w.Header().Set("Content-Type", "application/zip")
-	if resp.ContentLength > 0 {
-		w.Header().Set("Content-Length", fmt.Sprintf("%d", resp.ContentLength))
-		log.Printf("[INFO] Downloading zip %s (size: %d bytes)", path, resp.ContentLength)
-	}
-
-	// Stream to both response and cache with buffered copy for better performance
-	multiWriter := io.MultiWriter(w, cacheFile)
-	startTime := time.Now()
-
-	// Use CopyBuffer with larger buffer for better performance on large files
-	buf := make([]byte, 64*1024) // 64KB buffer
-	bytesCopied, err := io.CopyBuffer(multiWriter, resp.Body, buf)
-	cacheFile.Close()
-
-	if err != nil {
-		p.mu.Unlock()
-		log.Printf("[ERROR] Error copying zip for %s: %v (copied %d bytes in %v)", path, err, bytesCopied, time.Since(startTime))
-		// Remove partial cache file on error
-		os.Remove(cachePath + ".tmp")
-		// Note: Response may already be partially written, but that's acceptable
-		return
-	}
-
-	log.Printf("[SUCCESS] Cached zip %s (%d bytes in %v)", path, bytesCopied, time.Since(startTime))
-
-	// Atomically rename temp file to final cache file
-	tmpPath := cachePath + ".tmp"
-	
-	// Check if temp file exists before renaming
-	if _, err := os.Stat(tmpPath); os.IsNotExist(err) {
-		// Temp file doesn't exist - might have been renamed by another goroutine
-		// Check if final file exists (another goroutine might have already cached it)
 		if _, err := os.Stat(cachePath); err == nil {
-			log.Printf("[INFO] Cache file already exists for %s (likely cached by another request)", path)
-			return
+			os.Remove(tmpPath)
+			p.mu.Unlock()
+			return cachePath, nil
 		}
-		log.Printf("[WARN] Temp cache file missing for %s but final file doesn't exist", path)
+		if err := os.Rename(tmpPath, cachePath); err != nil {
+			os.Remove(tmpPath)
+			p.mu.Unlock()
+			return "", err
+		}
+		p.mu.Unlock()
+		return cachePath, nil
+	})
+
+	if err != nil {
+		writeFetchError(w, requestPath, err)
 		return
 	}
-	
-	// Check if final file already exists (race condition - another goroutine cached it first)
-	if _, err := os.Stat(cachePath); err == nil {
-		// Final file already exists, remove temp file
-		os.Remove(tmpPath)
-		log.Printf("[INFO] Cache file already exists for %s, removing duplicate temp file", path)
+
+	if p.usageStore != nil {
+		p.usageStore.RecordUsage(requestPath)
+	}
+
+	file, err = os.Open(finalPath)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to read cache: %v", err), http.StatusInternalServerError)
 		return
 	}
-	
-	// Perform atomic rename
-	if err := os.Rename(tmpPath, cachePath); err != nil {
-		// Check if it's because the file already exists (race condition)
-		if _, statErr := os.Stat(cachePath); statErr == nil {
-			// Final file exists now, just remove temp
-			os.Remove(tmpPath)
-			log.Printf("[INFO] Cache file was created by another request for %s", path)
-		} else {
-			log.Printf("[WARN] Failed to rename cache file for %s: %v", path, err)
-			os.Remove(tmpPath)
-		}
-	}
-	p.mu.Unlock() // Release lock after cache write is complete
+	defer file.Close()
+	stat, _ := file.Stat()
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", stat.Size()))
+	io.Copy(w, file)
 }
