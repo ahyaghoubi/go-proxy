@@ -34,6 +34,16 @@ func NewUsageStore(cacheDir string) (*UsageStore, error) {
 		return nil, err
 	}
 
+	// Configure SQLite for better concurrency: set a busy timeout and use WAL journal mode.
+	if _, err = db.Exec(`PRAGMA busy_timeout = 5000;`); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if _, err = db.Exec(`PRAGMA journal_mode = WAL;`); err != nil {
+		db.Close()
+		return nil, err
+	}
+
 	_, err = db.Exec(schema)
 	if err != nil {
 		db.Close()
@@ -77,12 +87,26 @@ func (u *UsageStore) RecordUsage(path string) {
 	}
 
 	now := time.Now().Unix()
-	_, err := u.db.Exec(
-		"INSERT OR REPLACE INTO cache_usage (module_path, last_used_at) VALUES (?, ?)",
-		module, now,
-	)
-	if err != nil {
-		log.Printf("[WARN] Failed to record usage for %s: %v", module, err)
+	const maxAttempts = 5
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		_, err := u.db.Exec(
+			"INSERT OR REPLACE INTO cache_usage (module_path, last_used_at) VALUES (?, ?)",
+			module, now,
+		)
+		if err == nil {
+			return
+		}
+		// Best-effort handling of SQLITE_BUSY / "database is locked" errors.
+		// We match on the error string to avoid depending on driver-specific error types.
+		if !strings.Contains(err.Error(), "database is locked") {
+			log.Printf("[WARN] Failed to record usage for %s: %v", module, err)
+			return
+		}
+		if attempt == maxAttempts {
+			log.Printf("[WARN] Failed to record usage for %s after %d attempts (database is locked): %v", module, maxAttempts, err)
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

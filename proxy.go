@@ -15,12 +15,14 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/miekg/dns"
+	"github.com/vbauerster/mpb/v8"
+	"github.com/vbauerster/mpb/v8/decor"
 	"golang.org/x/net/proxy"
 )
 
@@ -33,9 +35,7 @@ func (e *upstreamStatusError) Error() string {
 	return fmt.Sprintf("upstream returned %d", e.status)
 }
 
-var progressOutputMu sync.Mutex
-
-// isStderrTTY returns true if stderr is a terminal (supports \r for in-place updates)
+// isStderrTTY returns true if stderr is a terminal (supports in-place progress updates)
 func isStderrTTY() bool {
 	fi, err := os.Stderr.Stat()
 	if err != nil {
@@ -44,50 +44,86 @@ func isStderrTTY() bool {
 	return fi.Mode()&os.ModeCharDevice != 0
 }
 
-// progressReader wraps an io.Reader and reports download progress
+// progressReader wraps an io.Reader and reports download progress to an mpb bar when enabled.
 type progressReader struct {
-	reader         io.Reader
-	total          int64
-	downloaded     atomic.Int64
-	path           string
-	startTime      time.Time
-	progressTicker *time.Ticker
-	done           chan struct{}
+	reader io.ReadCloser
+	bar    *mpb.Bar
 }
 
-// newProgressReader creates a reader that logs progress at regular intervals
-func newProgressReader(r io.Reader, total int64, path string) *progressReader {
-	pr := &progressReader{
-		reader:    r,
-		total:     total,
-		path:      path,
-		startTime: time.Now(),
-		done:      make(chan struct{}),
+// newProgressReader creates a reader that reports progress to the given mpb
+// progress container (nil to disable). When total <= 0, no bar is created.
+// completed allows the bar to start at a non-zero offset (for resumed downloads).
+func newProgressReader(r io.ReadCloser, total, completed int64, path string, progress *mpb.Progress) *progressReader {
+	pr := &progressReader{reader: r}
+	if progress == nil || total <= 0 {
+		return pr
 	}
-	pr.downloaded.Store(0)
 
-	// Log progress every 500ms
-	pr.progressTicker = time.NewTicker(500 * time.Millisecond)
-	go pr.logProgress()
+	name := path
+	if len(name) > 60 {
+		name = "..." + name[len(name)-57:]
+	}
+
+	if completed < 0 {
+		completed = 0
+	}
+	if completed > total {
+		completed = total
+	}
+
+	bar := progress.New(total,
+		mpb.BarStyle().Rbound("|"),
+		mpb.PrependDecorators(
+			decor.Name(name, decor.WC{C: decor.DindentRight | decor.DextraSpace}),
+		),
+		mpb.AppendDecorators(appendDownloadBarDecorators()...),
+	)
+
+	// Wrap the reader with bar.ProxyReader so increments are handled internally.
+	if proxyReader := bar.ProxyReader(r); proxyReader != nil {
+		pr.reader = proxyReader
+		if completed > 0 {
+			bar.IncrInt64(completed)
+		}
+		pr.bar = bar
+	}
 	return pr
 }
 
 func (pr *progressReader) Read(p []byte) (n int, err error) {
-	n, err = pr.reader.Read(p)
-	pr.downloaded.Add(int64(n))
-	return n, err
+	return pr.reader.Read(p)
 }
 
 func (pr *progressReader) Close() {
-	pr.progressTicker.Stop()
-	close(pr.done)
-	// Finalize the progress line with newline so next log appears below (TTY: \r line has no \n yet)
-	progressOutputMu.Lock()
-	if isStderrTTY() {
-		fmt.Fprint(os.Stderr, "\n")
+	if pr.reader != nil {
+		_ = pr.reader.Close()
 	}
-	os.Stderr.Sync()
-	progressOutputMu.Unlock()
+}
+
+// appendDownloadBarDecorators returns mpb append decorators with explicit labels
+// so the bar reads like: " 11% | ETA 49m56s | 30.44 KiB/s ]"
+func appendDownloadBarDecorators() []decor.Decorator {
+	return []decor.Decorator{
+		decor.Percentage(),
+		decor.Name(" | ETA "),
+		decor.EwmaETA(decor.ET_STYLE_GO, 30),
+		decor.Name(" | "),
+		decor.EwmaSpeed(decor.SizeB1024(0), "% .2f", 30),
+		decor.Name(" ]"),
+	}
+}
+
+// chunkWriter streams a range into a file at a fixed starting offset using WriteAt.
+// It is safe to use concurrently from multiple goroutines as long as ranges do not overlap.
+type chunkWriter struct {
+	f   *os.File
+	off int64
+}
+
+func (w *chunkWriter) Write(p []byte) (int, error) {
+	n, err := w.f.WriteAt(p, w.off)
+	w.off += int64(n)
+	return n, err
 }
 
 func formatBytes(b int64) string {
@@ -101,60 +137,6 @@ func formatBytes(b int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
-}
-
-func (pr *progressReader) logProgress() {
-	for {
-		select {
-		case <-pr.done:
-			return
-		case <-pr.progressTicker.C:
-			downloaded := pr.downloaded.Load()
-			elapsed := time.Since(pr.startTime).Seconds()
-			speed := float64(0)
-			if elapsed > 0 {
-				speed = float64(downloaded) / elapsed
-			}
-
-			var progressLine string
-			if pr.total > 0 {
-				percent := float64(downloaded) / float64(pr.total) * 100
-				remaining := pr.total - downloaded
-				eta := time.Duration(0)
-				if speed > 0 && remaining > 0 {
-					eta = time.Duration(float64(remaining)/speed) * time.Second
-				}
-
-				// Progress bar: 20 chars
-				barWidth := 20
-				filled := int(percent / 100 * float64(barWidth))
-				if filled > barWidth {
-					filled = barWidth
-				}
-				bar := strings.Repeat("=", filled) + ">" + strings.Repeat(" ", barWidth-filled)
-				if filled == barWidth {
-					bar = strings.Repeat("=", barWidth)
-				}
-
-				progressLine = fmt.Sprintf("[%s] %5.1f%% | %s/s | %s left | ETA %v",
-					bar, percent, formatBytes(int64(speed)), formatBytes(remaining), eta.Round(time.Second))
-			} else {
-				progressLine = fmt.Sprintf("downloaded %s | %s/s",
-					formatBytes(downloaded), formatBytes(int64(speed)))
-			}
-
-			// In-place update: overwrite same line until download finishes (\r = carriage return)
-			// Use \r for TTY (stays at bottom), \n for non-TTY (e.g. Docker logs) so updates appear live
-			progressOutputMu.Lock()
-			if isStderrTTY() {
-				fmt.Fprintf(os.Stderr, "\r[DOWNLOAD] %s | %s    ", pr.path, progressLine)
-			} else {
-				fmt.Fprintf(os.Stderr, "[DOWNLOAD] %s | %s\n", pr.path, progressLine)
-			}
-			os.Stderr.Sync() // Flush so output appears live
-			progressOutputMu.Unlock()
-		}
-	}
 }
 
 // DNSResolver handles different DNS protocol types
@@ -391,18 +373,22 @@ type inFlightFetch struct {
 
 // Proxy handles Go module proxy requests with disk caching
 type Proxy struct {
-	cacheDir        string
-	upstreams       []string
-	privateUpstreams []PrivateUpstream
-	gosumdb         string
-	gonosumdb       []string
-	retryAttempts   int
-	retryBackoff    time.Duration
-	client          *http.Client
-	usageStore      *UsageStore
-	mu              sync.RWMutex
-	inFlightMu      sync.Mutex
-	inFlight        map[string]*inFlightFetch
+	cacheDir          string
+	upstreams         []string
+	privateUpstreams  []PrivateUpstream
+	gosumdb           string
+	gonosumdb         []string
+	retryAttempts        int
+	retryBackoff         time.Duration
+	downloadConnections  int
+	maxConcurrentDownloads int
+	downloadSem          chan struct{}
+	client               *http.Client
+	usageStore           *UsageStore
+	progress             *mpb.Progress
+	mu                   sync.RWMutex
+	inFlightMu           sync.Mutex
+	inFlight             map[string]*inFlightFetch
 }
 
 // NewProxyFromConfig creates a proxy from Config with all features (upstreams, retry, dedup, etc.)
@@ -417,6 +403,16 @@ func NewProxyFromConfig(cfg *Config, maxCacheAge, cleanupInterval, retryBackoff 
 
 	gonosumdb := parseGONOSUMDB(cfg.GONOSUMDB)
 
+	downloadConns := cfg.DownloadConnections
+	if downloadConns <= 0 {
+		downloadConns = 4
+	}
+
+	maxConc := cfg.MaxConcurrentDownloads
+	if maxConc < 0 {
+		maxConc = 0
+	}
+
 	p := newProxyWithClient(
 		cfg.CacheDir,
 		upstreams,
@@ -425,6 +421,8 @@ func NewProxyFromConfig(cfg *Config, maxCacheAge, cleanupInterval, retryBackoff 
 		gonosumdb,
 		cfg.RetryAttempts,
 		retryBackoff,
+		downloadConns,
+		maxConc,
 		cfg.Proxy,
 		cfg.DNSServer,
 		maxCacheAge,
@@ -456,23 +454,42 @@ func newProxyWithClient(
 	gonosumdb []string,
 	retryAttempts int,
 	retryBackoff time.Duration,
+	downloadConnections int,
+	maxConcurrentDownloads int,
 	httpProxy, dnsServer string,
 	maxCacheAge, cleanupInterval time.Duration,
 ) *Proxy {
-	transport := createTransport(httpProxy, dnsServer)
+	transport := createTransport(httpProxy, dnsServer, downloadConnections)
+
+	var downloadSem chan struct{}
+	if maxConcurrentDownloads > 0 {
+		downloadSem = make(chan struct{}, maxConcurrentDownloads)
+	}
+
+	var progress *mpb.Progress
+	if isStderrTTY() {
+		progress = mpb.New(
+			mpb.WithOutput(os.Stderr),
+			mpb.WithRefreshRate(100*time.Millisecond),
+		)
+	}
 
 	p := &Proxy{
-		cacheDir:        cacheDir,
-		upstreams:       upstreams,
-		privateUpstreams: privateUpstreams,
-		gosumdb:         gosumdb,
-		gonosumdb:       gonosumdb,
-		retryAttempts:   retryAttempts,
-		retryBackoff:    retryBackoff,
+		cacheDir:          cacheDir,
+		upstreams:         upstreams,
+		privateUpstreams:  privateUpstreams,
+		gosumdb:           gosumdb,
+		gonosumdb:         gonosumdb,
+		retryAttempts:        retryAttempts,
+		retryBackoff:         retryBackoff,
+		downloadConnections:  downloadConnections,
+		maxConcurrentDownloads: maxConcurrentDownloads,
+		downloadSem:          downloadSem,
 		client: &http.Client{
-			Timeout:   5 * time.Minute,
+			Timeout:   30 * time.Minute,
 			Transport: transport,
 		},
+		progress: progress,
 		inFlight: make(map[string]*inFlightFetch),
 	}
 
@@ -488,14 +505,26 @@ func newProxyWithClient(
 		log.Printf("[WARN] Failed to initialize usage store: %v (cache TTL cleanup disabled)", err)
 	} else {
 		p.usageStore = usageStore
-		go usageStore.RunCleanup(maxCacheAge, cleanupInterval)
+		if maxCacheAge > 0 && cleanupInterval > 0 {
+			go usageStore.RunCleanup(maxCacheAge, cleanupInterval)
+		}
 	}
 
 	return p
 }
 
 // createTransport builds an http.Transport from proxy and DNS config
-func createTransport(httpProxy, dnsServer string) *http.Transport {
+func createTransport(httpProxy, dnsServer string, maxConnsPerHost int) *http.Transport {
+	if maxConnsPerHost <= 0 {
+		maxConnsPerHost = 10
+	}
+	if maxConnsPerHost < 10 {
+		maxConnsPerHost = 10
+	}
+	if maxConnsPerHost > 100 {
+		maxConnsPerHost = 100
+	}
+
 	dnsResolver, err := createDNSResolver(dnsServer)
 	if err != nil {
 		log.Printf("[WARN] Failed to create DNS resolver: %v", err)
@@ -512,7 +541,7 @@ func createTransport(httpProxy, dnsServer string) *http.Transport {
 		ResponseHeaderTimeout: 10 * time.Second,
 		IdleConnTimeout:       90 * time.Second,
 		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   10,
+		MaxIdleConnsPerHost:   maxConnsPerHost,
 	}
 
 	proxyURL := httpProxy
@@ -572,13 +601,16 @@ func NewProxy(cacheDir, upstream, httpProxy, dnsServer string, maxCacheAge, clea
 	upstreams := []string{strings.TrimSuffix(upstream, "/")}
 	return newProxyWithClient(
 		cacheDir, upstreams, nil, "sum.golang.org", nil,
-		3, 100*time.Millisecond,
+		3, 100*time.Millisecond, 1, 0,
 		httpProxy, dnsServer, maxCacheAge, cleanupInterval,
 	)
 }
 
-// Shutdown stops background cleanup and closes the usage store.
+// Shutdown stops background cleanup, progress UI, and closes the usage store.
 func (p *Proxy) Shutdown() {
+	if p.progress != nil {
+		p.progress.Wait()
+	}
 	if p.usageStore != nil {
 		p.usageStore.Stop()
 		_ = p.usageStore.Close()
@@ -696,6 +728,80 @@ func (p *Proxy) fetchFromUpstreams(requestPath string, req *http.Request) (*http
 		return resp, nil
 	}
 	return nil, lastErr
+}
+
+const minSizeForParallelDownload = 512 * 1024 // 512KB
+
+// getZipContentLength returns the upstream base URL, auth, content length if known, and whether parallel download is possible.
+func (p *Proxy) getZipContentLength(ctx context.Context, requestPath string) (baseURL string, auth *AuthConfig, contentLength int64, ok bool) {
+	baseURL, auth = p.selectUpstream(requestPath)
+	var upstreams []string
+	if auth != nil {
+		upstreams = []string{baseURL}
+	} else {
+		upstreams = p.upstreams
+		if len(upstreams) == 0 {
+			upstreams = []string{"https://proxy.golang.org"}
+		}
+	}
+
+	for _, u := range upstreams {
+		u = strings.TrimSuffix(u, "/")
+		fetchURL := u + "/" + requestPath
+
+		// Try HEAD first
+		headReq, err := http.NewRequestWithContext(ctx, http.MethodHead, fetchURL, nil)
+		if err != nil {
+			continue
+		}
+		addAuthHeaders(headReq, auth)
+		resp, err := p.client.Do(headReq)
+		if err == nil && resp.StatusCode == http.StatusOK && resp.ContentLength > 0 {
+			resp.Body.Close()
+			return u, auth, resp.ContentLength, true
+		}
+		if resp != nil {
+			resp.Body.Close()
+		}
+
+		// Try Range 0-0 to get total from Content-Range
+		rangeReq, err := http.NewRequestWithContext(ctx, http.MethodGet, fetchURL, nil)
+		if err != nil {
+			continue
+		}
+		addAuthHeaders(rangeReq, auth)
+		rangeReq.Header.Set("Range", "bytes=0-0")
+		resp, err = p.doWithRetry(rangeReq)
+		if err != nil {
+			continue
+		}
+		if resp.StatusCode == http.StatusPartialContent {
+			cr := resp.Header.Get("Content-Range")
+			resp.Body.Close()
+			// Format: "bytes 0-0/12345"
+			if idx := strings.LastIndex(cr, "/"); idx >= 0 && idx+1 < len(cr) {
+				if total, err := strconv.ParseInt(strings.TrimSpace(cr[idx+1:]), 10, 64); err == nil && total > 0 {
+					return u, auth, total, true
+				}
+			}
+		} else if resp != nil {
+			resp.Body.Close()
+		}
+	}
+	return baseURL, auth, 0, false
+}
+
+// fetchRange fetches a byte range from the given upstream. Caller must close the response body.
+func (p *Proxy) fetchRange(ctx context.Context, baseURL, requestPath string, start, end int64, auth *AuthConfig) (*http.Response, error) {
+	fetchURL := strings.TrimSuffix(baseURL, "/") + "/" + requestPath
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fetchURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	addAuthHeaders(req, auth)
+	// HTTP Range is inclusive: bytes=0-499 means bytes 0 through 499
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end-1))
+	return p.doWithRetry(req)
 }
 
 // fetchWithDedup fetches bytes with in-flight deduplication
@@ -993,35 +1099,244 @@ func (p *Proxy) handleZip(w http.ResponseWriter, r *http.Request, requestPath st
 	log.Printf("[CACHE MISS] %s", requestPath)
 
 	finalPath, err := p.fetchZipWithDedup(requestPath, cachePath, func() (string, error) {
-		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Minute)
+		// Global limit on concurrent package downloads (zip fetches)
+		if p.downloadSem != nil {
+			select {
+			case p.downloadSem <- struct{}{}:
+				defer func() { <-p.downloadSem }()
+			case <-r.Context().Done():
+				return "", r.Context().Err()
+			}
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Minute)
 		defer cancel()
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "", nil)
-		resp, err := p.fetchFromUpstreams(requestPath, req)
-		if err != nil {
-			return "", err
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			return "", fmt.Errorf("upstream returned %d", resp.StatusCode)
-		}
 
 		if err := os.MkdirAll(filepath.Dir(cachePath), 0755); err != nil {
 			return "", err
 		}
 		tmpPath := cachePath + ".tmp"
-		tmpFile, err := os.Create(tmpPath)
-		if err != nil {
-			return "", err
-		}
-		totalSize := resp.ContentLength
-		progressBody := newProgressReader(resp.Body, totalSize, requestPath)
-		buf := make([]byte, 64*1024)
-		_, err = io.CopyBuffer(tmpFile, progressBody, buf)
-		progressBody.Close()
-		tmpFile.Close()
-		if err != nil {
-			os.Remove(tmpPath)
-			return "", err
+
+		baseURL, auth, contentLength, useParallel := p.getZipContentLength(ctx, requestPath)
+		useParallel = useParallel && contentLength >= minSizeForParallelDownload && p.downloadConnections > 1
+
+		if useParallel {
+			// Parallel download via Range requests, with simple resume support.
+			var tmpFile *os.File
+			var haveExisting bool
+			if fi, err := os.Stat(tmpPath); err == nil && fi.Size() == contentLength {
+				tmpFile, err = os.OpenFile(tmpPath, os.O_RDWR, 0644)
+				if err != nil {
+					return "", err
+				}
+				haveExisting = true
+			} else {
+				// Start fresh.
+				_ = os.Remove(tmpPath)
+				var err error
+				tmpFile, err = os.Create(tmpPath)
+				if err != nil {
+					return "", err
+				}
+				if err := tmpFile.Truncate(contentLength); err != nil {
+					tmpFile.Close()
+					os.Remove(tmpPath)
+					return "", err
+				}
+			}
+
+			var bar *mpb.Bar
+			if p.progress != nil {
+				name := requestPath
+				if len(name) > 60 {
+					name = "..." + name[len(name)-57:]
+				}
+				bar = p.progress.New(contentLength,
+					mpb.BarStyle().Rbound("|"),
+					mpb.PrependDecorators(
+						decor.Name(name, decor.WC{C: decor.DindentRight | decor.DextraSpace}),
+					),
+					mpb.AppendDecorators(appendDownloadBarDecorators()...),
+				)
+			}
+
+			type chunk struct {
+				start int64
+				end   int64
+				skip  bool
+			}
+
+			chunkSize := (contentLength + int64(p.downloadConnections) - 1) / int64(p.downloadConnections)
+			var (
+				chunks          []chunk
+				initialComplete int64
+			)
+			for i := 0; i < p.downloadConnections; i++ {
+				start := int64(i) * chunkSize
+				end := start + chunkSize
+				if end > contentLength {
+					end = contentLength
+				}
+				if start >= end {
+					continue
+				}
+
+				ch := chunk{start: start, end: end}
+				if haveExisting {
+					// Treat a chunk as completed if both its first and last bytes are non-zero.
+					buf := make([]byte, 1)
+					_, err1 := tmpFile.ReadAt(buf, start)
+					first := err1 == nil && buf[0] != 0
+					_, err2 := tmpFile.ReadAt(buf, end-1)
+					last := err2 == nil && buf[0] != 0
+					if first && last {
+						ch.skip = true
+						initialComplete += end - start
+					}
+				}
+				chunks = append(chunks, ch)
+			}
+
+			if bar != nil && initialComplete > 0 {
+				bar.IncrInt64(initialComplete)
+			}
+
+			var wg sync.WaitGroup
+			errs := make([]error, len(chunks))
+			for i, ch := range chunks {
+				if ch.skip {
+					continue
+				}
+				wg.Add(1)
+				go func(i int, ch chunk) {
+					defer wg.Done()
+					resp, err := p.fetchRange(ctx, baseURL, requestPath, ch.start, ch.end, auth)
+					if err != nil {
+						errs[i] = err
+						return
+					}
+					defer resp.Body.Close()
+					if resp.StatusCode != http.StatusPartialContent {
+						errs[i] = fmt.Errorf("expected 206, got %d", resp.StatusCode)
+						return
+					}
+
+					var reader io.Reader = resp.Body
+					var proxy io.ReadCloser
+					if bar != nil {
+						// Wrap this range reader so mpb can track bytes as they stream in.
+						proxy = bar.ProxyReader(resp.Body)
+						if proxy != nil {
+							reader = proxy
+							defer proxy.Close()
+						}
+					}
+
+					w := &chunkWriter{f: tmpFile, off: ch.start}
+					if _, err := io.Copy(w, reader); err != nil {
+						errs[i] = err
+						return
+					}
+				}(i, ch)
+			}
+			wg.Wait()
+			// If there were errors, abort the bar so it doesn't leak.
+			var hadErr bool
+			for _, e := range errs {
+				if e != nil {
+					hadErr = true
+					break
+				}
+			}
+			if bar != nil {
+				if hadErr {
+					bar.Abort(true)
+				} else {
+					bar.SetTotal(contentLength, true)
+				}
+			}
+			if err := tmpFile.Close(); err != nil {
+				os.Remove(tmpPath)
+				return "", err
+			}
+			for _, e := range errs {
+				if e != nil {
+					os.Remove(tmpPath)
+					return "", e
+				}
+			}
+		} else {
+			// Single-connection download with basic resume support.
+			partPath := cachePath + ".part"
+			tmpPath = partPath
+
+			var existingSize int64
+			if fi, err := os.Stat(partPath); err == nil {
+				existingSize = fi.Size()
+			}
+
+			// Only attempt resume when we know the total size and the partial is smaller.
+			if contentLength <= 0 || existingSize >= contentLength {
+				if existingSize > 0 {
+					_ = os.Remove(partPath)
+					existingSize = 0
+				}
+			}
+
+			var resp *http.Response
+			// Try to resume using HTTP Range.
+			if existingSize > 0 && contentLength > 0 {
+				resp, err = p.fetchRange(ctx, baseURL, requestPath, existingSize, contentLength, auth)
+				if err != nil || resp.StatusCode != http.StatusPartialContent {
+					if resp != nil {
+						resp.Body.Close()
+					}
+					// Fallback to a full fresh download.
+					_ = os.Remove(partPath)
+					existingSize = 0
+					resp = nil
+				}
+			}
+
+			if resp == nil {
+				// Fresh full download when no usable partial exists.
+				req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "", nil)
+				resp, err = p.fetchFromUpstreams(requestPath, req)
+				if err != nil {
+					return "", err
+				}
+				if resp.StatusCode != http.StatusOK {
+					resp.Body.Close()
+					return "", fmt.Errorf("upstream returned %d", resp.StatusCode)
+				}
+			}
+
+			defer resp.Body.Close()
+
+			var tmpFile *os.File
+			if existingSize > 0 {
+				tmpFile, err = os.OpenFile(partPath, os.O_WRONLY|os.O_APPEND, 0644)
+			} else {
+				tmpFile, err = os.Create(partPath)
+			}
+			if err != nil {
+				return "", err
+			}
+
+			totalSize := contentLength
+			if totalSize <= 0 {
+				totalSize = resp.ContentLength
+			}
+
+			progressBody := newProgressReader(resp.Body, totalSize, existingSize, requestPath, p.progress)
+			buf := make([]byte, 256*1024)
+			_, err = io.CopyBuffer(tmpFile, progressBody, buf)
+			progressBody.Close()
+			tmpFile.Close()
+			if err != nil {
+				os.Remove(partPath)
+				return "", err
+			}
 		}
 
 		data, err := os.ReadFile(tmpPath)

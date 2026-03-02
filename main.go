@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -21,12 +22,14 @@ var (
 	httpProxy      = flag.String("proxy", "", "HTTP/HTTPS/SOCKS5 proxy URL")
 	dnsServer      = flag.String("dns", "", "DNS server URL")
 	writeTimeout   = flag.String("write-timeout", "30m", "HTTP write timeout")
-	maxCacheAge    = flag.String("max-cache-age", "720h", "Remove cached modules unused for this duration")
+	maxCacheAge    = flag.String("max-cache-age", "0s", "Remove cached modules unused for this duration (0s = unlimited, disables cleanup)")
 	cleanupInterval = flag.String("cleanup-interval", "24h", "How often to run cache cleanup")
-	gosumdb        = flag.String("gosumdb", "sum.golang.org", "Checksum database URL (off to disable)")
+	gosumdb        = flag.String("gosumdb", "off", "Checksum database URL (`off` to disable; e.g. `sum.golang.org` to enable)")
 	gonosumdb      = flag.String("gonosumdb", "", "Comma-separated module patterns to skip checksum verification")
-	retryAttempts  = flag.Int("retry-attempts", 3, "Number of retry attempts for upstream requests")
-	retryBackoff   = flag.String("retry-backoff", "100ms", "Initial backoff duration for retries")
+	retryAttempts        = flag.Int("retry-attempts", 3, "Number of retry attempts for upstream requests")
+	retryBackoff         = flag.String("retry-backoff", "100ms", "Initial backoff duration for retries")
+	downloadConnections  = flag.Int("download-connections", 4, "Parallel connections for zip downloads (1=disabled)")
+	maxConcurrentDownloads = flag.Int("max-concurrent-downloads", 4, "Maximum number of packages downloading concurrently (0=unlimited)")
 )
 
 func main() {
@@ -80,6 +83,16 @@ func main() {
 	if v := os.Getenv("GONOSUMDB"); v != "" {
 		cfg.GONOSUMDB = v
 	}
+	if v := os.Getenv("DOWNLOAD_CONNECTIONS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.DownloadConnections = n
+		}
+	}
+	if v := os.Getenv("MAX_CONCURRENT_DOWNLOADS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			cfg.MaxConcurrentDownloads = n
+		}
+	}
 
 	// Flag overrides (highest priority)
 	cfg.Port = *port
@@ -96,6 +109,8 @@ func main() {
 	cfg.GONOSUMDB = *gonosumdb
 	cfg.RetryAttempts = *retryAttempts
 	cfg.RetryBackoff = *retryBackoff
+	cfg.DownloadConnections = *downloadConnections
+	cfg.MaxConcurrentDownloads = *maxConcurrentDownloads
 
 	// Resolve proxy from env if flag not set
 	if cfg.Proxy == "" {
@@ -113,9 +128,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("Invalid write-timeout value '%s': %v", cfg.WriteTimeout, err)
 	}
-	maxCacheAgeDur, err := time.ParseDuration(cfg.MaxCacheAge)
-	if err != nil {
-		log.Fatalf("Invalid max-cache-age value '%s': %v", cfg.MaxCacheAge, err)
+	var maxCacheAgeDur time.Duration
+	if cfg.MaxCacheAge != "" {
+		maxCacheAgeDur, err = time.ParseDuration(cfg.MaxCacheAge)
+		if err != nil {
+			log.Fatalf("Invalid max-cache-age value '%s': %v", cfg.MaxCacheAge, err)
+		}
 	}
 	cleanupIntervalDur, err := time.ParseDuration(cfg.CleanupInterval)
 	if err != nil {
@@ -155,7 +173,11 @@ func main() {
 		log.Printf("  DNS server: %s", cfg.DNSServer)
 	}
 	log.Printf("  Write timeout: %v", writeTimeoutDur)
-	log.Printf("  Max cache age: %v (cleanup every %v)", maxCacheAgeDur, cleanupIntervalDur)
+	if maxCacheAgeDur <= 0 {
+		log.Printf("  Max cache age: unlimited (cleanup disabled)")
+	} else {
+		log.Printf("  Max cache age: %v (cleanup every %v)", maxCacheAgeDur, cleanupIntervalDur)
+	}
 	log.Printf("  Set GOPROXY=http://localhost%s,direct", addr)
 
 	go func() {
@@ -235,5 +257,11 @@ func mergeConfig(dst *Config, src *Config) {
 	}
 	if src.RetryBackoff != "" {
 		dst.RetryBackoff = src.RetryBackoff
+	}
+	if src.DownloadConnections > 0 {
+		dst.DownloadConnections = src.DownloadConnections
+	}
+	if src.MaxConcurrentDownloads >= 0 {
+		dst.MaxConcurrentDownloads = src.MaxConcurrentDownloads
 	}
 }

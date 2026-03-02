@@ -13,7 +13,7 @@ A production-ready local Go module proxy server that caches downloaded packages 
 - ✅ HTTP client with proper timeouts and connection pooling
 - ✅ Content-Length headers for HTTP compliance
 - ✅ Comprehensive logging
-- ✅ Download progress (in-place progress bar, speed, remaining data, ETA) for zip files
+- ✅ Download progress: live-updating progress block at the bottom (TTY) or throttled lines (Docker/logs) with speed, ETA for zip files
 - ✅ Cache TTL: SQLite-backed last-used tracking; automatic cleanup of modules unused beyond configurable age (default 30 days)
 - ✅ Environment variable and CLI flag support
 - ✅ **Request deduplication**: concurrent requests for the same module version share a single upstream fetch
@@ -22,6 +22,8 @@ A production-ready local Go module proxy server that caches downloaded packages 
 - ✅ **Multiple upstreams**: ordered fallback list (e.g. proxy.golang.org → goproxy.cn)
 - ✅ **Private module support**: route requests by module pattern to custom upstreams with auth (Basic, Bearer, custom headers)
 - ✅ **Config file**: YAML or JSON config (auto-detected by extension); `-config` flag or `GOPROXY_CONFIG` env
+- ✅ **Parallel zip downloads**: multiple HTTP connections (Range requests) for faster large module fetches
+- ✅ **Resumable zip downloads**: after a restart, single-connection downloads resume from `.part` via Range; parallel downloads reuse completed chunks in `.tmp`
 
 ## Architecture
 
@@ -100,12 +102,14 @@ Options:
 - `-cache`: Cache directory path (default: `./cache`)
 - `-upstream`: Upstream proxy URL(s), comma-separated for fallback (default: `https://proxy.golang.org`)
 - `-config`: Path to YAML or JSON config file (overrides defaults; flags override config)
-- `-max-cache-age`: Remove cached modules unused for this duration (default: `720h` = 30 days; e.g., `168h` = 7 days)
+- `-max-cache-age`: Remove cached modules unused for this duration (default: `0s` = unlimited; e.g., `720h` = 30 days)
 - `-cleanup-interval`: How often to run cache cleanup (default: `24h`)
-- `-gosumdb`: Checksum database URL (default: `sum.golang.org`; use `off` to disable verification)
+- `-gosumdb`: Checksum database URL (default: `off`; set to e.g. `sum.golang.org` to enable verification)
 - `-gonosumdb`: Comma-separated module patterns to skip checksum verification (e.g. `*.corp.example.com,github.com/myorg/*`)
 - `-retry-attempts`: Number of retries for upstream requests on transient failures (default: `3`)
 - `-retry-backoff`: Initial backoff duration for retries (default: `100ms`; exponential backoff applies)
+- `-download-connections`: Number of parallel HTTP connections for zip downloads (default: `4`; set to `1` to disable)
+- `-max-concurrent-downloads`: Maximum number of packages (zip files) downloading concurrently (default: `4`; `0` = unlimited)
 
 #### Environment Variables
 
@@ -116,8 +120,12 @@ export PORT=3000
 export CACHE_DIR=/path/to/cache
 export UPSTREAM_PROXY=https://proxy.golang.org,https://goproxy.cn
 export GOPROXY_CONFIG=./config.yaml
-export GOSUMDB=sum.golang.org
+# Optional: enable checksum verification (default is disabled)
+# export GOSUMDB=sum.golang.org
 export GONOSUMDB="*.corp.example.com"
+export DOWNLOAD_CONNECTIONS=4
+export MAX_CONCURRENT_DOWNLOADS=4
+# Optional: enable cache TTL cleanup (default is unlimited)
 export MAX_CACHE_AGE=720h
 export CLEANUP_INTERVAL=24h
 ./goproxy
@@ -125,7 +133,7 @@ export CLEANUP_INTERVAL=24h
 
 ### Cache TTL and Cleanup
 
-The proxy tracks when each cached module was last used (via SQLite at `cache/.usage.db`). A background job periodically removes modules that have not been accessed within the configured max age.
+The proxy tracks when each cached module was last used (via SQLite at `cache/.usage.db`). When a positive `max-cache-age` is configured, a background job periodically removes modules that have not been accessed within that age. By default (`0s`), **TTL cleanup is disabled** and cached modules are kept indefinitely.
 
 Example: remove modules unused for 30 days, run cleanup every 24 hours:
 
@@ -139,6 +147,19 @@ Or via environment:
 export MAX_CACHE_AGE=720h
 export CLEANUP_INTERVAL=24h
 ./goproxy
+```
+
+### Faster Zip Downloads (Parallel Connections)
+
+For zip (module) downloads, the proxy can use multiple HTTP connections in parallel when the upstream supports [Range requests](https://developer.mozilla.org/en-US/docs/Web/HTTP/Range_requests). This can significantly speed up large module downloads.
+
+- **Default**: 4 parallel connections for zips larger than 512 KB.
+- **Disable**: set `-download-connections=1` or `DOWNLOAD_CONNECTIONS=1`.
+- **Tune**: e.g. `-download-connections=8` or `download_connections: 8` in config.
+- **Resume**: If the proxy is stopped mid-download and restarted, the next request for the same zip will resume (single-connection from `.part` via Range, or parallel by reusing completed chunks in `.tmp`).
+
+```bash
+./goproxy -download-connections 8
 ```
 
 ### Configure Go to Use the Proxy
@@ -173,7 +194,7 @@ export GOPROXY_CONFIG=./config.yaml
 
 **Load order:** defaults → config file → environment → flags (flags have highest priority)
 
-Example `config.yaml`:
+Example `config.yaml` (enables 30-day TTL cleanup):
 
 ```yaml
 port: "12345"
@@ -192,11 +213,13 @@ private_upstreams:
     auth:
       type: basic
       value: "user:pass"
-gosumdb: "sum.golang.org"
+gosumdb: "off"
 gonosumdb: "*.corp.example.com,github.com/myorg/*"
 retry_attempts: 3
 retry_backoff: 100ms
-max_cache_age: 720h
+download_connections: 4
+max_concurrent_downloads: 4
+max_cache_age: 720h  # use 0s for unlimited (no TTL cleanup)
 cleanup_interval: 24h
 ```
 
@@ -212,15 +235,18 @@ Or in config: `upstreams: [url1, url2, ...]`
 
 ### Checksum Verification
 
-By default, zip files are verified against the checksum database (`sum.golang.org`) before serving. To skip verification for private modules:
+By default, checksum verification is **disabled** (equivalent to `-gosumdb off`), which avoids contacting a checksum database.
+
+To enable verification against the public checksum database:
 
 ```bash
-./goproxy -gonosumdb "*.corp.example.com,github.com/myorg/*"
+./goproxy -gosumdb sum.golang.org
 ```
 
-To disable verification entirely:
+To skip verification for specific private modules while verification is enabled:
+
 ```bash
-./goproxy -gosumdb off
+./goproxy -gosumdb sum.golang.org -gonosumdb "*.corp.example.com,github.com/myorg/*"
 ```
 
 ### Private Module Support
@@ -615,7 +641,7 @@ cache/
 
 The proxy uses a properly configured HTTP client with:
 
-- **Total request timeout**: 30 seconds
+- **Total request timeout**: 30 minutes
 - **Connection timeout**: 5 seconds
 - **TLS handshake timeout**: 5 seconds
 - **Response header timeout**: 10 seconds
@@ -642,7 +668,7 @@ The proxy logs:
 - Errors with context
 - Startup configuration
 - Shutdown events
-- **Download progress** for zip files: progress bar, download speed, remaining bytes, and ETA; updates every 500ms until done. On a TTY, updates stay at the bottom (same line via carriage return). When stderr is a pipe or file (e.g. Docker logs), each update goes to a new line so progress appears live.
+- **Download progress** for zip files. In an interactive terminal (TTY), progress is rendered using the [`mpb`](https://pkg.go.dev/github.com/vbauerster/mpb/v8) multi-progress bar library, showing per-module percentage, ETA, and speed in a compact bar UI at the bottom of the screen while regular logs scroll above. When stderr is not a TTY (for example Docker logs or CI), progress bars are disabled to avoid flooding logs with control sequences, and you only see the usual request/cache logs.
 
 Example log output:
 ```
@@ -657,13 +683,7 @@ Example log output:
 2024/01/01 12:00:06 [CACHE HIT] github.com/example/module/@v/v1.0.0.info
 ```
 
-When downloading large zip files (cache miss), progress updates in place on a single line until the download completes:
-```
-2024/01/01 12:00:10 [INFO] Downloading zip github.com/example/module/@v/v1.0.0.zip (size: 2.5 MB)
-[DOWNLOAD] github.com/example/module/@v/v1.0.0.zip | [================>    ] 82.1% | 489.2 KB/s | 448.0 KB left | ETA 1s
-2024/01/01 12:00:12 [SUCCESS] Cached zip github.com/example/module/@v/v1.0.0.zip (2.5 MB in 2.1s, avg 1.2 MB/s)
-```
-(The progress line updates every 500ms on the same line via carriage return until the download finishes.)
+When downloading zip files (cache miss) in a TTY, each active download gets its own mpb bar with the module path and labeled stats: **percentage** complete, **ETA** (time remaining), and **transfer speed** (e.g. `11% | ETA 49m56s | 30.44 KiB/s`). The bar stays confined to stderr and does not affect HTTP responses.
 
 ## Development
 
@@ -688,8 +708,9 @@ go test -v ./...
 The test suite covers:
 - **cache.go**: `cachePath`, `readCache`, `writeCache` (including empty data, atomic write), `cacheExists`
 - **usage.go**: `pathToModule`, `RecordUsage`, `LoadStaleModules`, `DeleteModule`, `NewUsageStore`, `RunCleanup`/`cleanupOnce` (stale module deletion), empty module path, nonexistent dir on delete
-- **proxy.go**: `formatBytes`, health check, method validation, list/info/mod/zip handlers (cache hit and miss), upstream errors (404, 500), invalid JSON (handleInfo), zip with unknown Content-Length, progress reader
-- **download progress**: output format (path, %, speed, remaining, ETA), live updates (multiple progress lines for slow downloads), stderr capture and TTY vs non-TTY behavior
+- **proxy.go**: `formatBytes`, health check, method validation, list/info/mod/zip handlers (cache hit and miss), upstream errors (404, 500), invalid JSON (handleInfo), zip with unknown Content-Length, mpb-based progress integration
+- **download progress**: integration with `mpb` in TTY environments and verification that progress handling does not interfere with HTTP responses or caching
+- **resumable downloads**: single-connection resume from `.part` (Range request), fallback to full GET when server does not support Range; parallel resume by skipping completed chunks in `.tmp`; no resume when `.tmp` has wrong size
 - **edge cases**: `Proxy.Shutdown` with nil usageStore
 
 ### Generating go.sum
@@ -760,7 +781,7 @@ The proxy will recreate it on startup.
 - **Request deduplication**: In-flight requests for the same path share a single upstream fetch
 - **Checksum verification**: Zip validation via GOSUMDB; skip with GONOSUMDB for private modules
 - **Private upstreams**: Per-module routing with Basic, Bearer, or custom header auth
-- **New flags**: `-config`, `-gosumdb`, `-gonosumdb`, `-retry-attempts`, `-retry-backoff`
+- **New flags**: `-config`, `-gosumdb`, `-gonosumdb`, `-retry-attempts`, `-retry-backoff`, `-download-connections`
 
 ## License
 

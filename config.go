@@ -40,6 +40,8 @@ type Config struct {
 	GONOSUMDB         string           `yaml:"gonosumdb" json:"gonosumdb"`
 	RetryAttempts     int              `yaml:"retry_attempts" json:"retry_attempts"`
 	RetryBackoff      string           `yaml:"retry_backoff" json:"retry_backoff"`
+	DownloadConnections   int          `yaml:"download_connections" json:"download_connections"`
+	MaxConcurrentDownloads int         `yaml:"max_concurrent_downloads" json:"max_concurrent_downloads"`
 }
 
 // LoadConfig loads configuration from a YAML or JSON file (auto-detected by extension)
@@ -71,15 +73,17 @@ func LoadConfig(path string) (*Config, error) {
 // DefaultConfig returns default configuration values
 func DefaultConfig() Config {
 	return Config{
-		Port:            "12345",
-		CacheDir:        "./cache",
-		Upstreams:       []string{"https://proxy.golang.org"},
-		WriteTimeout:    "30m",
-		MaxCacheAge:     "720h",
-		CleanupInterval: "24h",
-		GOSUMDB:         "sum.golang.org",
-		RetryAttempts:   3,
-		RetryBackoff:    "100ms",
+		Port:                   "12345",
+		CacheDir:               "./cache",
+		Upstreams:              []string{"https://proxy.golang.org"},
+		WriteTimeout:           "30m",
+		MaxCacheAge:            "0s",
+		CleanupInterval:        "24h",
+		GOSUMDB:                "off",
+		RetryAttempts:          3,
+		RetryBackoff:           "100ms",
+		DownloadConnections:    4,
+		MaxConcurrentDownloads: 4,
 	}
 }
 
