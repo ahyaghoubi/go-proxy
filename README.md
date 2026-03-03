@@ -9,11 +9,21 @@ A production-ready local Go module proxy server that caches downloaded packages 
 - ✅ Thread-safe cache operations
 - ✅ Atomic file writes to prevent corruption
 - ✅ Graceful shutdown handling
-- ✅ Configurable upstream proxy
+- ✅ Configurable upstream proxy (single or multiple with fallback)
 - ✅ HTTP client with proper timeouts and connection pooling
 - ✅ Content-Length headers for HTTP compliance
 - ✅ Comprehensive logging
+- ✅ Download progress: live-updating progress block at the bottom (TTY) or throttled lines (Docker/logs) with speed, ETA for zip files
+- ✅ Cache TTL: SQLite-backed last-used tracking; automatic cleanup of modules unused beyond configurable age (default 30 days)
 - ✅ Environment variable and CLI flag support
+- ✅ **Request deduplication**: concurrent requests for the same module version share a single upstream fetch
+- ✅ **Retry with backoff**: automatic retries on transient failures (5xx, 429, network errors) with exponential backoff
+- ✅ **Checksum verification**: validates zip files via sum.golang.org; skip with GONOSUMDB for private modules
+- ✅ **Multiple upstreams**: ordered fallback list (e.g. proxy.golang.org → goproxy.cn)
+- ✅ **Private module support**: route requests by module pattern to custom upstreams with auth (Basic, Bearer, custom headers)
+- ✅ **Config file**: YAML or JSON config (auto-detected by extension); `-config` flag or `GOPROXY_CONFIG` env
+- ✅ **Parallel zip downloads**: multiple HTTP connections (Range requests) for faster large module fetches
+- ✅ **Resumable zip downloads**: after a restart, single-connection downloads resume from `.part` via Range; parallel downloads reuse completed chunks in `.tmp`
 
 ## Architecture
 
@@ -90,17 +100,66 @@ This will:
 Options:
 - `-port`: Port to listen on (default: `12345`)
 - `-cache`: Cache directory path (default: `./cache`)
-- `-upstream`: Upstream proxy URL (default: `https://proxy.golang.org`)
+- `-upstream`: Upstream proxy URL(s), comma-separated for fallback (default: `https://proxy.golang.org`)
+- `-config`: Path to YAML or JSON config file (overrides defaults; flags override config)
+- `-max-cache-age`: Remove cached modules unused for this duration (default: `0s` = unlimited; e.g., `720h` = 30 days)
+- `-cleanup-interval`: How often to run cache cleanup (default: `24h`)
+- `-gosumdb`: Checksum database URL (default: `off`; set to e.g. `sum.golang.org` to enable verification)
+- `-gonosumdb`: Comma-separated module patterns to skip checksum verification (e.g. `*.corp.example.com,github.com/myorg/*`)
+- `-retry-attempts`: Number of retries for upstream requests on transient failures (default: `3`)
+- `-retry-backoff`: Initial backoff duration for retries (default: `100ms`; exponential backoff applies)
+- `-download-connections`: Number of parallel HTTP connections for zip downloads (default: `4`; set to `1` to disable)
+- `-max-concurrent-downloads`: Maximum number of packages (zip files) downloading concurrently (default: `4`; `0` = unlimited)
 
 #### Environment Variables
 
-Environment variables override command-line flags:
+Environment variables override config file; flags override environment:
 
 ```bash
 export PORT=3000
 export CACHE_DIR=/path/to/cache
-export UPSTREAM_PROXY=https://proxy.golang.org
+export UPSTREAM_PROXY=https://proxy.golang.org,https://goproxy.cn
+export GOPROXY_CONFIG=./config.yaml
+# Optional: enable checksum verification (default is disabled)
+# export GOSUMDB=sum.golang.org
+export GONOSUMDB="*.corp.example.com"
+export DOWNLOAD_CONNECTIONS=4
+export MAX_CONCURRENT_DOWNLOADS=4
+# Optional: enable cache TTL cleanup (default is unlimited)
+export MAX_CACHE_AGE=720h
+export CLEANUP_INTERVAL=24h
 ./goproxy
+```
+
+### Cache TTL and Cleanup
+
+The proxy tracks when each cached module was last used (via SQLite at `cache/.usage.db`). When a positive `max-cache-age` is configured, a background job periodically removes modules that have not been accessed within that age. By default (`0s`), **TTL cleanup is disabled** and cached modules are kept indefinitely.
+
+Example: remove modules unused for 30 days, run cleanup every 24 hours:
+
+```bash
+./goproxy -max-cache-age 720h -cleanup-interval 24h
+```
+
+Or via environment:
+
+```bash
+export MAX_CACHE_AGE=720h
+export CLEANUP_INTERVAL=24h
+./goproxy
+```
+
+### Faster Zip Downloads (Parallel Connections)
+
+For zip (module) downloads, the proxy can use multiple HTTP connections in parallel when the upstream supports [Range requests](https://developer.mozilla.org/en-US/docs/Web/HTTP/Range_requests). This can significantly speed up large module downloads.
+
+- **Default**: 4 parallel connections for zips larger than 512 KB.
+- **Disable**: set `-download-connections=1` or `DOWNLOAD_CONNECTIONS=1`.
+- **Tune**: e.g. `-download-connections=8` or `download_connections: 8` in config.
+- **Resume**: If the proxy is stopped mid-download and restarted, the next request for the same zip will resume (single-connection from `.part` via Range, or parallel by reusing completed chunks in `.tmp`).
+
+```bash
+./goproxy -download-connections 8
 ```
 
 ### Configure Go to Use the Proxy
@@ -118,6 +177,85 @@ GOPROXY=http://localhost:12345,direct go get example.com/module
 ```
 
 The `,direct` fallback ensures that if the proxy doesn't have a module, Go will fetch it directly from the source.
+
+### Config File (YAML/JSON)
+
+You can use a config file for all settings. Format is auto-detected by extension (`.yaml`, `.yml`, or `.json`).
+
+```bash
+./goproxy -config config.yaml
+```
+
+Or via environment:
+```bash
+export GOPROXY_CONFIG=./config.yaml
+./goproxy
+```
+
+**Load order:** defaults → config file → environment → flags (flags have highest priority)
+
+Example `config.yaml` (enables 30-day TTL cleanup):
+
+```yaml
+port: "12345"
+cache_dir: "./cache"
+upstreams:
+  - https://proxy.golang.org
+  - https://goproxy.cn
+private_upstreams:
+  - pattern: "github.com/myorg/*"
+    url: "https://myproxy.corp.com"
+    auth:
+      type: bearer
+      value: "ghp_xxx"
+  - pattern: "*.corp.example.com"
+    url: "https://nexus.corp.example.com"
+    auth:
+      type: basic
+      value: "user:pass"
+gosumdb: "off"
+gonosumdb: "*.corp.example.com,github.com/myorg/*"
+retry_attempts: 3
+retry_backoff: 100ms
+download_connections: 4
+max_concurrent_downloads: 4
+max_cache_age: 720h  # use 0s for unlimited (no TTL cleanup)
+cleanup_interval: 24h
+```
+
+### Multiple Upstreams
+
+Use comma-separated upstream URLs for fallback when one fails (404/410) or on transient errors (after retries):
+
+```bash
+./goproxy -upstream "https://proxy.golang.org,https://goproxy.cn"
+```
+
+Or in config: `upstreams: [url1, url2, ...]`
+
+### Checksum Verification
+
+By default, checksum verification is **disabled** (equivalent to `-gosumdb off`), which avoids contacting a checksum database.
+
+To enable verification against the public checksum database:
+
+```bash
+./goproxy -gosumdb sum.golang.org
+```
+
+To skip verification for specific private modules while verification is enabled:
+
+```bash
+./goproxy -gosumdb sum.golang.org -gonosumdb "*.corp.example.com,github.com/myorg/*"
+```
+
+### Private Module Support
+
+Route requests for certain module path prefixes to custom upstreams with authentication. Use the config file for `private_upstreams`; patterns use Go `path.Match` globs.
+
+Auth types: `basic` (value: `user:pass`), `bearer` (value: token), `header` (name: header name, value: header value).
+
+See the config file example above.
 
 ### Proxy Support (For Sanctions/Geo-blocking)
 
@@ -447,6 +585,9 @@ environment:
   # DNS_SERVER: https://cloudflare-dns.com/dns-query
   # Or use DoT
   # DNS_SERVER: tls://1.1.1.1:853
+  # Cache TTL (remove modules unused for 30 days, cleanup every 24h):
+  # MAX_CACHE_AGE: 720h
+  # CLEANUP_INTERVAL: 24h
 ```
 
 Then restart the service:
@@ -485,6 +626,7 @@ The cache directory structure mirrors the proxy URL structure:
 
 ```
 cache/
+├── .usage.db          # SQLite DB for last-used timestamps (cache TTL)
 ├── github.com/
 │   └── user/
 │       └── repo/
@@ -499,7 +641,7 @@ cache/
 
 The proxy uses a properly configured HTTP client with:
 
-- **Total request timeout**: 30 seconds
+- **Total request timeout**: 30 minutes
 - **Connection timeout**: 5 seconds
 - **TLS handshake timeout**: 5 seconds
 - **Response header timeout**: 10 seconds
@@ -526,19 +668,22 @@ The proxy logs:
 - Errors with context
 - Startup configuration
 - Shutdown events
+- **Download progress** for zip files. In an interactive terminal (TTY), progress is rendered using the [`mpb`](https://pkg.go.dev/github.com/vbauerster/mpb/v8) multi-progress bar library, showing per-module percentage, ETA, and speed in a compact bar UI at the bottom of the screen while regular logs scroll above. When stderr is not a TTY (for example Docker logs or CI), progress bars are disabled to avoid flooding logs with control sequences, and you only see the usual request/cache logs.
 
 Example log output:
 ```
 2024/01/01 12:00:00 Starting Go module proxy server
 2024/01/01 12:00:00   Port: 12345
 2024/01/01 12:00:00   Cache directory: ./cache
-2024/01/01 12:00:00   Upstream proxy: https://proxy.golang.org
+2024/01/01 12:00:00   Upstreams: [https://proxy.golang.org]
 2024/01/01 12:00:00   Set GOPROXY=http://localhost:12345,direct
 2024/01/01 12:00:05 [127.0.0.1] GET github.com/example/module/@v/list
 2024/01/01 12:00:05 [CACHE MISS] github.com/example/module/@v/list
 2024/01/01 12:00:06 [127.0.0.1] GET github.com/example/module/@v/v1.0.0.info
 2024/01/01 12:00:06 [CACHE HIT] github.com/example/module/@v/v1.0.0.info
 ```
+
+When downloading zip files (cache miss) in a TTY, each active download gets its own mpb bar with the module path and labeled stats: **percentage** complete, **ETA** (time remaining), and **transfer speed** (e.g. `11% | ETA 49m56s | 30.44 KiB/s`). The bar stays confined to stderr and does not affect HTTP responses.
 
 ## Development
 
@@ -553,6 +698,20 @@ go build -o goproxy
 ```bash
 go test ./...
 ```
+
+Run with verbose output:
+
+```bash
+go test -v ./...
+```
+
+The test suite covers:
+- **cache.go**: `cachePath`, `readCache`, `writeCache` (including empty data, atomic write), `cacheExists`
+- **usage.go**: `pathToModule`, `RecordUsage`, `LoadStaleModules`, `DeleteModule`, `NewUsageStore`, `RunCleanup`/`cleanupOnce` (stale module deletion), empty module path, nonexistent dir on delete
+- **proxy.go**: `formatBytes`, health check, method validation, list/info/mod/zip handlers (cache hit and miss), upstream errors (404, 500), invalid JSON (handleInfo), zip with unknown Content-Length, mpb-based progress integration
+- **download progress**: integration with `mpb` in TTY environments and verification that progress handling does not interfere with HTTP responses or caching
+- **resumable downloads**: single-connection resume from `.part` (Range request), fallback to full GET when server does not support Range; parallel resume by skipping completed chunks in `.tmp`; no resume when `.tmp` has wrong size
+- **edge cases**: `Proxy.Shutdown` with nil usageStore
 
 ### Generating go.sum
 
@@ -611,6 +770,18 @@ The proxy will recreate it on startup.
 - Cache files are stored with 0644 permissions (readable by all)
 - Consider implementing cache size limits and cleanup policies for production use
 - Monitor logs for unusual activity
+
+## Changelog
+
+### What's New
+
+- **Config file**: YAML/JSON support via `-config` or `GOPROXY_CONFIG`
+- **Multiple upstreams**: Comma-separated fallback list via `-upstream`
+- **Retry with backoff**: Configurable retries on 5xx, 429, and network errors
+- **Request deduplication**: In-flight requests for the same path share a single upstream fetch
+- **Checksum verification**: Zip validation via GOSUMDB; skip with GONOSUMDB for private modules
+- **Private upstreams**: Per-module routing with Basic, Bearer, or custom header auth
+- **New flags**: `-config`, `-gosumdb`, `-gonosumdb`, `-retry-attempts`, `-retry-backoff`, `-download-connections`
 
 ## License
 

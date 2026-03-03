@@ -1,5 +1,3 @@
-version: "3.8"
-
 services:
   goproxy:
     build:
@@ -27,6 +25,11 @@ services:
     #   # DNS_SERVER: https://cloudflare-dns.com/dns-query
     #   # DNS_SERVER: tls://1.1.1.1:853
     #   # DNS_SERVER: quic://dns.adguard.com:853
+    #   # Cache TTL: remove modules unused for this long (e.g. 720h = 30 days).
+    #   # Default is unlimited (no TTL cleanup); uncomment to enable:
+    #   # MAX_CACHE_AGE: 720h
+    #   # How often to run cleanup:
+    #   CLEANUP_INTERVAL: 24h
     restart: unless-stopped
     healthcheck:
       test:
